@@ -1,0 +1,23 @@
+schedule:
+  tweets_per_day: 2
+  window_start: "09:00"
+  window_end: "22:00"
+  timezone: "Asia/Jakarta"
+  min_gap_minutes: 120
+
+content_mix:
+  funny_meme: 60
+  technical: 30
+  personal: 10
+
+gif:
+  attach_probability: 40
+  max_size_bytes: 5242880
+
+gemini:
+  model: "gemini-2.5-flash"
+  temperature: 1.2
+
+history:
+  max_entries: 500
+  similarity_threshold: 0.3

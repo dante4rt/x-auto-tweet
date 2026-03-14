@@ -8,8 +8,14 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/dghubble/oauth1"
+)
+
+const (
+	maxPostRetries = 5
+	baseRetryDelay = 2 * time.Second
 )
 
 const tweetsEndpoint = "https://api.twitter.com/2/tweets"
@@ -50,8 +56,18 @@ func NewClient(apiKey, apiSecret, accessToken, accessTokenSecret string) *Client
 	return &Client{httpClient: httpClient}
 }
 
+// isRetryableStatus returns true for transient HTTP errors worth retrying.
+func isRetryableStatus(code int) bool {
+	return code == http.StatusTooManyRequests ||
+		code == http.StatusInternalServerError ||
+		code == http.StatusBadGateway ||
+		code == http.StatusServiceUnavailable ||
+		code == http.StatusGatewayTimeout
+}
+
 // PostTweet publishes a tweet and returns the new tweet's ID.
 // If mediaID is non-empty it is attached as a media reference.
+// Retries up to maxPostRetries times on transient server errors with exponential backoff.
 func (c *Client) PostTweet(ctx context.Context, text string, mediaID string) (string, error) {
 	body := tweetRequest{Text: text}
 	if mediaID != "" {
@@ -63,39 +79,69 @@ func (c *Client) PostTweet(ctx context.Context, text string, mediaID string) (st
 		return "", fmt.Errorf("marshaling tweet request: %w", err)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, tweetsEndpoint, bytes.NewReader(payload))
-	if err != nil {
-		return "", fmt.Errorf("creating tweet request: %w", err)
-	}
-	req.Header.Set("Content-Type", "application/json")
-
 	slog.Info("posting tweet", "text_length", len(text), "has_media", mediaID != "")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("sending tweet request: %w", err)
-	}
-	defer resp.Body.Close()
+	var lastErr error
+	for attempt := 0; attempt < maxPostRetries; attempt++ {
+		if attempt > 0 {
+			delay := baseRetryDelay * (1 << (attempt - 1))
+			slog.Warn("retrying tweet post",
+				"attempt", attempt+1,
+				"delay", delay.String(),
+				"last_error", lastErr,
+			)
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(delay):
+			}
+		}
 
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("reading tweet response: %w", err)
-	}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, tweetsEndpoint, bytes.NewReader(payload))
+		if err != nil {
+			return "", fmt.Errorf("creating tweet request: %w", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
 
-	if resp.StatusCode != http.StatusCreated {
-		slog.Error("tweet post failed",
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			lastErr = fmt.Errorf("sending tweet request: %w", err)
+			continue
+		}
+
+		respBody, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("reading tweet response: %w", err)
+			continue
+		}
+
+		if resp.StatusCode == http.StatusCreated {
+			var tweetResp tweetResponse
+			if err := json.Unmarshal(respBody, &tweetResp); err != nil {
+				return "", fmt.Errorf("unmarshaling tweet response: %w", err)
+			}
+			slog.Info("tweet posted successfully", "tweet_id", tweetResp.Data.ID)
+			return tweetResp.Data.ID, nil
+		}
+
+		lastErr = fmt.Errorf("twitter API returned status %d: %s", resp.StatusCode, string(respBody))
+
+		if !isRetryableStatus(resp.StatusCode) {
+			slog.Error("tweet post failed with non-retryable status",
+				"status_code", resp.StatusCode,
+				"response", string(respBody),
+			)
+			return "", lastErr
+		}
+
+		slog.Warn("tweet post got retryable error",
 			"status_code", resp.StatusCode,
-			"response", string(respBody),
+			"attempt", attempt+1,
+			"max_retries", maxPostRetries,
 		)
-		return "", fmt.Errorf("twitter API returned status %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	var tweetResp tweetResponse
-	if err := json.Unmarshal(respBody, &tweetResp); err != nil {
-		return "", fmt.Errorf("unmarshaling tweet response: %w", err)
-	}
-
-	slog.Info("tweet posted successfully", "tweet_id", tweetResp.Data.ID)
-
-	return tweetResp.Data.ID, nil
+	slog.Error("tweet post failed after all retries", "attempts", maxPostRetries)
+	return "", fmt.Errorf("tweet post failed after %d retries: %w", maxPostRetries, lastErr)
 }
